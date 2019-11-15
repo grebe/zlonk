@@ -1,31 +1,77 @@
 package zlonk
 
-import zlonk.implicits._
 import chisel3._
 import chisel3.experimental.{Analog, ChiselAnnotation, RunFirrtlTransform, annotate, requireIsChiselType, requireIsHardware}
 import chisel3.util.{Cat, log2Ceil}
 import firrtl._
 import firrtl.annotations.{NoTargetAnnotation, SingleTargetAnnotation, Target}
 import firrtl.ir._
-import firrtl.options.{RegisteredTransform, ShellOption}
+import firrtl.options.{HasShellOptions, Phase, PhaseManager, Shell, ShellOption, Stage, StageMain}
 
 import scala.collection.immutable.ListMap
-import scala.language.existentials
+import zlonk.implicits._
 
-case class ShrMemThresholdAnnotation(threshold: Int) extends NoTargetAnnotation
-case class ReplaceShrAnnotation(target: Target, params: SHRParams[_ <: Data]) extends SingleTargetAnnotation[Target] {
+sealed trait ShrImplType {
+  def cost(params: ShrParams[Data]): Int
+  def impl[T <: Data]: Class[_ <: ShrImpl[T]]
+}
+
+trait FFImpl extends ShrImplType {
+  def impl[T <: Data] = classOf[FFSHR[T]]
+}
+trait SinglePortSyncMemImpl extends ShrImplType {
+  def impl[T <: Data] = classOf[SPMemSHR[T]]
+}
+trait DualPortSyncMemImpl extends ShrImplType {
+  def impl[T <: Data] = classOf[DPMemSHR[T]]
+}
+
+case class ThresholdFFImpl(threshold: Int) extends FFImpl {
+  def cost(params: ShrParams[Data]): Int = if (params.proto.getWidth * params.delay < threshold) {
+    -1 // 0
+  } else {
+    -1 // 1
+  }
+}
+case class ThresholdSinglePortSyncMemImpl(threshold: Int) extends SinglePortSyncMemImpl {
+  def cost(params: ShrParams[Data]): Int = if (params.proto.getWidth * params.delay < threshold) {
+    1
+  } else {
+    0
+  }
+}
+case class ThresholdDualPortSyncMemImpl(threshold: Int) extends DualPortSyncMemImpl {
+  def cost(params: ShrParams[Data]): Int = if (params.proto.getWidth * params.delay < threshold) {
+    1
+  } else {
+    0
+  }
+}
+
+trait ShrImplOptions {
+  def impls: Seq[ShrImplType]
+  def bestImpl(params: ShrParams[_ <: Data]): ShrImplType = impls.minBy(i => i.cost(params))
+  def bestShr[T <: Data](params: ShrParams[T]): ShrImpl[T] = {
+    val impl = bestImpl(params).impl
+    val constructor = impl.getConstructor(classOf[ShrParams[T]])
+    constructor.newInstance(params).asInstanceOf[ShrImpl[T]]
+  }
+}
+
+case class ThresholdShrImplOptions(threshold: Int = 16 * 32, useSP: Boolean = false) extends ShrImplOptions {
+  def impls = Seq(ThresholdFFImpl(threshold),
+    (if (useSP) ThresholdSinglePortSyncMemImpl(threshold) else ThresholdDualPortSyncMemImpl(threshold)))
+}
+
+sealed trait ShrOptionAnnotation
+
+case class ShrMemThresholdAnnotation(threshold: Int) extends NoTargetAnnotation with ShrOptionAnnotation
+case class ShrSinglePortMemAnnotation(useSP: Boolean) extends NoTargetAnnotation with ShrOptionAnnotation
+case class ReplaceShrAnnotation(target: Target, params: ShrParams[_ <: Data]) extends SingleTargetAnnotation[Target] {
   override def duplicate(n: Target): ReplaceShrAnnotation = this.copy(target = target)
 }
-case class ReplaceShrChiselAnnotation(target: InstanceId, params: SHRParams[_ <: Data]) extends ChiselAnnotation with RunFirrtlTransform {
-  override def transformClass = classOf[SHRImplTransform]
-  override def toFirrtl: ReplaceShrAnnotation = ReplaceShrAnnotation(target.toTarget, params)
-}
-
-class SHRImplTransform extends Transform with RegisteredTransform {
-  def inputForm = MidForm // LowForm
-  def outputForm = HighForm
-
-  val defaultShrMemThreshold = 64
+case class ReplaceShrChiselAnnotation(target: InstanceId, params: ShrParams[_ <: Data]) extends ChiselAnnotation
+with RunFirrtlTransform with HasShellOptions {
 
   def options = Seq(
     new ShellOption[Int](
@@ -35,7 +81,54 @@ class SHRImplTransform extends Transform with RegisteredTransform {
       helpText = "Threshold to replace default FF-based SHR with memory-based SHR",
       helpValueName = Some("<threshold>")
     ),
+    new ShellOption[Boolean](
+      longOption = "shrMemUseSinglePort",
+      shortOption = Some("shrsp"),
+      toAnnotationSeq = (b: Boolean) => Seq(ShrSinglePortMemAnnotation(b)),
+      helpText = "Use single ported memories for shift registers",
+      helpValueName = Some("<useSP>")
+    )
   )
+
+  override def transformClass = classOf[ShrImplTransform]
+  override def toFirrtl: ReplaceShrAnnotation = ReplaceShrAnnotation(target.toTarget, params)
+}
+
+class ShrStage extends Stage {
+  val shell: Shell = new Shell("Shift Register Mapping")
+  val targets = Seq(
+    classOf[ShrPhase]
+  )
+
+  def run(annotations: AnnotationSeq): AnnotationSeq = {
+    println("Stage ran")
+    val annos = try {
+      new PhaseManager(targets)
+        .transformOrder
+        .foldLeft(annotations) { (a, f) => f.transform(a) }
+    } catch {
+      // todo better
+      case e: Exception => throw e
+    }
+    annos
+  }
+}
+
+object ShrMain extends StageMain(new ShrStage)
+
+class ShrPhase extends Phase {
+  override def transform(a: AnnotationSeq): AnnotationSeq = {
+    println("Phase ran")
+    a
+  }
+}
+
+class ShrImplTransform extends Transform { // with RegisteredTransform {
+  def inputForm = MidForm // LowForm
+  def outputForm = HighForm
+
+  val defaultShrMemThreshold = 64
+
 
   private def portToData(tpe: Type): Data = tpe match {
     case ClockType => UInt(0.W) // Clock()
@@ -62,38 +155,49 @@ class SHRImplTransform extends Transform with RegisteredTransform {
     override def cloneType: this.type = makeProto(ports).asInstanceOf[this.type]
   }
 
-  private def makeShr(name: String, ports: Seq[Port], params: SHRParams[_ <: Data], thresh: Int): firrtl.ir.DefModule = {
+  private def makeShr(name: String, ports: Seq[Port], params: ShrParams[_ <: Data], impl: ShrImplOptions): firrtl.ir.DefModule = {
     val io = makeProto(ports).elements("io")
     val io_in = io.asInstanceOf[Record].elements("in")
     val structuralParams = params.copy(proto = io_in)
-    val chiselCircuit = chisel3.Driver.elaborate(() => new FFSHR(structuralParams))
+    val chiselCircuit = chisel3.Driver.elaborate(() => impl.bestShr(structuralParams))
+      // new FFSHR(structuralParams))
     val firrtlCircuit = firrtl.Parser.parse(chisel3.Driver.emit(chiselCircuit))
     val mod = firrtlCircuit.modules.head.asInstanceOf[firrtl.ir.Module]
     mod.copy(name = name)
   }
 
   override def execute(state: CircuitState): CircuitState = {
-    val threshs = state.annotations.filter(_.getClass == classOf[ShrMemThresholdAnnotation])
-    require(threshs.length <= 1, "Specified SHR threshold twice")
-    val thresh: Int = threshs.headOption.map(_.asInstanceOf[ShrMemThresholdAnnotation].threshold)
-      .getOrElse(defaultShrMemThreshold)
-    val modNames: Map[String, SHRParams[_ <: Data]] = state.annotations.collect {
+    // val threshs = state.annotations.filter(_.getClass == classOf[ShrMemThresholdAnnotation])
+    // require(threshs.length <= 1, "Specified SHR threshold twice")
+    //val thresh: Int = threshs.headOption.map(_.asInstanceOf[ShrMemThresholdAnnotation].threshold)
+    //  .getOrElse(defaultShrMemThreshold)
+    val modNames: Map[String, ShrParams[_ <: Data]] = state.annotations.collect {
       case ReplaceShrAnnotation(t, p) => t.moduleOpt.get -> p
     }.toMap
+    val implAnnos = state.annotations.collectFirst {
+      case a: ShrImplOptions => a
+    }
+    val impl = if (implAnnos.isEmpty) {
+      ThresholdShrImplOptions()
+    } else if (implAnnos.size == 1) {
+      implAnnos.head
+    } else {
+        throw new Exception(s"Oh no! There are ${implAnnos.size} annotations giving parameters for shr mapping (should be 1)")
+    }
 
     val mods = state.circuit.modules.map {
       case firrtl.ir.Module(_, name, ports, _) if modNames.contains(name) =>
-        makeShr(name, ports, modNames(name), thresh)
+        makeShr(name, ports, modNames(name), impl)
       case m => m
     }
 
-    // println(mods.map(_.serialize).mkString("\n\n"))
+    println(mods.map(_.serialize).mkString("\n\n"))
 
     state.copy(circuit = state.circuit.copy(modules = mods))
   }
 }
 
-case class SHRParams[T <: Data]
+case class ShrParams[+T <: Data]
 (
   proto: T,
   delay: Int,
@@ -106,18 +210,22 @@ case class SHRParams[T <: Data]
   resetData.map(r => requireIsHardware(r))
 }
 
-class SHRIO[T <: Data](params: SHRParams[T]) extends Bundle {
+class ShrIO[+T <: Data](params: ShrParams[T]) extends Bundle {
   val in = chisel3.Input(params.proto.cloneType)
   val out = chisel3.Output(params.proto.cloneType)
   val en = if (params.hasEnable) Some(chisel3.Input(Bool())) else None
   val delay = if (params.programmableDepth) Some(chisel3.Input(UInt(log2Ceil(params.delay).W))) else None
 
-  override def cloneType = new SHRIO(params).asInstanceOf[this.type]
+  override def cloneType = new ShrIO(params).asInstanceOf[this.type]
 }
 
-class SPMemSHR[T <: Data](params: SHRParams[T]) extends chisel3.Module {
+trait ShrImpl[+T <: Data] extends RawModule {
+  val io: ShrIO[T]
+}
+
+class SPMemSHR[T <: Data](params: ShrParams[T]) extends chisel3.Module with ShrImpl[T] {
   require(params.delay > 3, "Single ported memory doesn't make sense for delay < 4")
-  val io = IO(new SHRIO(params))
+  val io = IO(new ShrIO(params))
 
   val memProto = UInt((2 * params.proto.getWidth).W)
   val memDepth = params.delay / 2 // ok  if delay is odd, we'll add a FF
@@ -168,9 +276,14 @@ class SPMemSHR[T <: Data](params: SHRParams[T]) extends chisel3.Module {
   }
 }
 
-class FFSHR[T <: Data](params: SHRParams[T]) extends chisel3.Module {
+class DPMemSHR[T <: Data](params: ShrParams[T]) extends chisel3.Module with ShrImpl[T] {
+  require(params.delay > 3, "Single ported memory doesn't make sense for delay < 4")
+  val io = IO(new ShrIO(params))
+}
+
+class FFSHR[T <: Data](params: ShrParams[T]) extends chisel3.Module with ShrImpl[T] {
   require(params.delay > 0)
-  val io = IO(new SHRIO(params))
+  val io = IO(new ShrIO(params))
 
   // Pack shift register into UInt. Makes the generated code a bit more compact
   val delays = params.resetData match {
@@ -199,7 +312,7 @@ class FFSHR[T <: Data](params: SHRParams[T]) extends chisel3.Module {
   }
 }
 
-class SHR[T <: Data](val shrParams: SHRParams[T]) extends chisel3.Module {
+class SHR[T <: Data](val shrParams: ShrParams[T]) extends chisel3.Module {
   override def desiredName: String = {
     val className = shrParams.proto.getClass.getSimpleName
     val progName = if (shrParams.programmableDepth) "prog_" else ""
@@ -208,7 +321,7 @@ class SHR[T <: Data](val shrParams: SHRParams[T]) extends chisel3.Module {
     s"SHR_${className}_${progName}${enName}${resetName}${shrParams.delay}"
   }
 
-  val io = IO(new SHRIO(shrParams))
+  val io = IO(new ShrIO(shrParams))
   annotate(ReplaceShrChiselAnnotation(this, shrParams.copy(proto = UInt())))
   dontTouch(io)
   io.out := io.in
@@ -219,7 +332,7 @@ object SHR {
     requireIsHardware(in)
     if (n > 0) {
       val shr = chisel3.Module(new SHR(
-        SHRParams(
+        ShrParams(
           chiselTypeOf(in),
           delay = n,
           programmableDepth = false,
@@ -237,7 +350,7 @@ object SHR {
     requireIsHardware(en)
     if (n > 0) {
       val shr = chisel3.Module(new SHR(
-        SHRParams(
+        ShrParams(
           chiselTypeOf(in),
           delay = n,
           programmableDepth = false,
@@ -257,7 +370,7 @@ object SHR {
     requireIsHardware(resetData)
     if (n > 0) {
       val shr = chisel3.Module(new SHR(
-        SHRParams(
+        ShrParams(
           chiselTypeOf(in),
           delay = n,
           programmableDepth = false,

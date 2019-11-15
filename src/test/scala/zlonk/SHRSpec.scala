@@ -61,25 +61,25 @@ class SHRSpec extends FlatSpec with Matchers {
   behavior of "SHR"
 
   it should "work with UInt" in {
-    SHRTester(() => new SHR(SHRParams(UInt(10.W), delay = 10)), Array[String]()) { c =>
+    SHRTester(() => new SHR(ShrParams(UInt(10.W), delay = 10)), Array[String]()) { c =>
       new UIntSHRTester(c)
     } should be (true)
   }
 
   it should "work with SInt" in {
-    SHRTester(() => new SHR(SHRParams(SInt(10.W), delay = 10)), Array[String]()) { c =>
+    SHRTester(() => new SHR(ShrParams(SInt(10.W), delay = 10)), Array[String]()) { c =>
       new SIntSHRTester(c)
     } should be (true)
   }
 
   it should "work with FixedPoint" in {
-    SHRTester(() => new SHR(SHRParams(FixedPoint(10.W, 4.BP), delay = 10)), Array[String]()) { c =>
+    SHRTester(() => new SHR(ShrParams(FixedPoint(10.W, 4.BP), delay = 10)), Array[String]()) { c =>
       new FixedPointSHRTester(c)
     } should be (true)
   }
 
   it should "work with Bundles and Vectors" in {
-    SHRTester(() => new SHR(SHRParams(new TestBundle, delay = 10)), Array[String]()) { c =>
+    SHRTester(() => new SHR(ShrParams(new TestBundle, delay = 10)), Array[String]()) { c =>
       new BundleSHRTester(c)
     } should be (true)
   }
