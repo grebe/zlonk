@@ -6,7 +6,7 @@ import chisel3.util.{Cat, log2Ceil}
 import firrtl._
 import firrtl.annotations.{NoTargetAnnotation, SingleTargetAnnotation, Target}
 import firrtl.ir._
-import firrtl.options.{HasShellOptions, Phase, PhaseManager, Shell, ShellOption, Stage, StageMain}
+import firrtl.options.{HasShellOptions, RegisteredLibrary, ShellOption}
 
 import scala.collection.immutable.ListMap
 import zlonk.implicits._
@@ -63,64 +63,44 @@ case class ThresholdShrImplOptions(threshold: Int = 16 * 32, useSP: Boolean = fa
     (if (useSP) ThresholdSinglePortSyncMemImpl(threshold) else ThresholdDualPortSyncMemImpl(threshold)))
 }
 
-sealed trait ShrOptionAnnotation
+sealed trait ShrOptionAnnotation extends NoTargetAnnotation
 
-case class ShrMemThresholdAnnotation(threshold: Int) extends NoTargetAnnotation with ShrOptionAnnotation
-case class ShrSinglePortMemAnnotation(useSP: Boolean) extends NoTargetAnnotation with ShrOptionAnnotation
-case class ReplaceShrAnnotation(target: Target, params: ShrParams[_ <: Data]) extends SingleTargetAnnotation[Target] {
-  override def duplicate(n: Target): ReplaceShrAnnotation = this.copy(target = target)
-}
-case class ReplaceShrChiselAnnotation(target: InstanceId, params: ShrParams[_ <: Data]) extends ChiselAnnotation
-with RunFirrtlTransform with HasShellOptions {
-
-  def options = Seq(
+case class ShrMemThresholdAnnotation(threshold: Int) extends ShrOptionAnnotation with HasShellOptions {
+  val options = Seq(
     new ShellOption[Int](
       longOption = "shrMemThreshold",
       shortOption = Some("shrmt"),
       toAnnotationSeq = (t: Int) => Seq(ShrMemThresholdAnnotation(t)),
       helpText = "Threshold to replace default FF-based SHR with memory-based SHR",
-      helpValueName = Some("<threshold>")
-    ),
+      helpValueName = Some("<threshold>")))
+}
+
+case class ShrSinglePortMemAnnotation(useSP: Boolean) extends ShrOptionAnnotation with HasShellOptions {
+  val options = Seq(
     new ShellOption[Boolean](
       longOption = "shrMemUseSinglePort",
       shortOption = Some("shrsp"),
       toAnnotationSeq = (b: Boolean) => Seq(ShrSinglePortMemAnnotation(b)),
       helpText = "Use single ported memories for shift registers",
-      helpValueName = Some("<useSP>")
-    )
-  )
+      helpValueName = Some("<useSP>")))
+}
 
+class ShrOptions extends RegisteredLibrary {
+  val name = "Shift Register Mapping Options"
+
+  val options: Seq[ShellOption[_]] = Seq(
+    ShrMemThresholdAnnotation(0),
+    ShrSinglePortMemAnnotation(true)
+  ).flatMap(_.options)
+}
+
+case class ReplaceShrAnnotation(target: Target, params: ShrParams[_ <: Data]) extends SingleTargetAnnotation[Target] {
+  override def duplicate(n: Target): ReplaceShrAnnotation = this.copy(target = target)
+}
+case class ReplaceShrChiselAnnotation(target: InstanceId, params: ShrParams[_ <: Data]) extends ChiselAnnotation
+with RunFirrtlTransform {
   override def transformClass = classOf[ShrImplTransform]
   override def toFirrtl: ReplaceShrAnnotation = ReplaceShrAnnotation(target.toTarget, params)
-}
-
-class ShrStage extends Stage {
-  val shell: Shell = new Shell("Shift Register Mapping")
-  val targets = Seq(
-    classOf[ShrPhase]
-  )
-
-  def run(annotations: AnnotationSeq): AnnotationSeq = {
-    println("Stage ran")
-    val annos = try {
-      new PhaseManager(targets)
-        .transformOrder
-        .foldLeft(annotations) { (a, f) => f.transform(a) }
-    } catch {
-      // todo better
-      case e: Exception => throw e
-    }
-    annos
-  }
-}
-
-object ShrMain extends StageMain(new ShrStage)
-
-class ShrPhase extends Phase {
-  override def transform(a: AnnotationSeq): AnnotationSeq = {
-    println("Phase ran")
-    a
-  }
 }
 
 class ShrImplTransform extends Transform { // with RegisteredTransform {
@@ -384,4 +364,8 @@ object SHR {
       in
     }
   }
+}
+
+object ShrApp extends App {
+  chisel3.Driver.execute(args, () => new SHR(ShrParams(UInt(10.W), 20)))
 }

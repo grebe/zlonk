@@ -73,7 +73,7 @@ class SHRSpec extends FlatSpec with Matchers {
   }
 
   it should "work with FixedPoint" in {
-    SHRTester(() => new SHR(ShrParams(FixedPoint(10.W, 4.BP), delay = 10)), Array[String]()) { c =>
+    SHRTester(() => new SHR(ShrParams(FixedPoint(10.W, 4.BP), delay = 10)), Array[String]("--help", "4")) { c =>
       new FixedPointSHRTester(c)
     } should be (true)
   }
