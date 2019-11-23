@@ -1,0 +1,6 @@
+fatload mmc 0 ${loadbit_addr} system.bit
+fpga loadb 0 ${loadbit_addr} ${filesize}
+fatload mmc 0 ${kernel_load_address} uImage
+fatload mmc 0 ${devicetree_load_address} system.dtb
+set mmc_rootfs_args setenv bootargs console=ttyPS1,115200 root=/dev/mmcblk1p2 rw earlyprintk rootfstype=ext4 rootwait ip=none devtmpfs.mount=1 ${optargs}
+run mmc_rootfs_args && bootm ${kernel_load_address} - ${devicetree_load_address}
