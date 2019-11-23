@@ -366,6 +366,9 @@ object SHR {
   }
 }
 
+// object ShrApp extends StageMain(new chisel3.stage.ChiselStage) {
+// }
+
 object ShrApp extends App {
-  chisel3.Driver.execute(args, () => new SHR(ShrParams(UInt(10.W), 20)))
+  chisel3.Driver.execute(args, () => new SHR(ShrParams(UInt(10.W), 10)))
 }
